@@ -1,0 +1,20 @@
+#!/bin/bash
+set -e
+
+# This command only exists to get me out of the habit of constantly doing hard resets
+# (seriously, there have been a few close calls thanks to muscle memory)
+
+if [ "$(git diff-index @)" = "" ]; then
+    echo "HEAD is clean, nothing to do!"
+    exit 1
+fi
+
+printf "\033[38;5;1mAre you sure you want to reset your head? Changes will be lost!\033[0m [y/N] "
+read -r RES
+
+if [ "$RES" = "y" ]; then
+    git reset --hard HEAD
+    echo "HEAD reset!"
+else
+    echo "Aborting..."
+fi

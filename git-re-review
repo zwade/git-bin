@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+
+set -e
+
+# This is where we store the api key & username
+CONFIG_FILE=~/.config/.z-gittools.json
+
+if [[ "$@" == "" || $@ == *"--help"* ]]; then
+    printf "Usage: git-re-review [options] <pr-number> [from-commit]\n"
+    printf "Options:\n"
+    printf "    --help           Display this help message\n"
+    printf "    --reset-username Reset your github username\n"
+    printf "    --reset-api-key  Reset your github API key\n"
+    printf "    --verbose        Display verbose output\n"
+    printf "\n"
+    printf "Arguments:\n"
+    printf "    <pr-number>      The PR number to get the review status of\n"
+    printf "    [from-commit]    The commit to start the re-review from (defaults to last review)\n"
+
+    exit 0
+fi
+
+export ARGS=($@)
+
+CONFIG_DATA=$(cat $CONFIG_FILE 2>/dev/null || true)
+
+USER_NAME=$(echo $CONFIG_DATA | yq  '.username')
+GITHUB_API_KEY=$(echo $CONFIG_DATA | yq  '.api_key')
+
+find_and_strip() {
+    for i in "${!ARGS[@]}"; do
+        if [[ "${ARGS[$i]}" == "$1" ]]; then
+            ARGS=( ${ARGS[@]/"$1"} )
+
+            export $2'=true'
+            return
+        fi
+    done
+
+    export $2'=false'
+}
+
+find_and_strip "--reset-username" RESET_USERNAME
+find_and_strip "--reset-api-key" RESET_API_KEY
+find_and_strip "--verbose" VERBOSE
+
+# First we grab the username. If it doesn't exist, request it and cache it in the config
+if [[ "$USER_NAME" == "null" || "$RESET_USERNAME" == "true" ]]; then
+    printf "What is your github username?: "
+    read USER_NAME
+
+    CONFIG_DATA=$(echo $CONFIG_DATA | U=$USER_NAME yq '.username = env(U)' -o json)
+    mkdir -p ~/.config
+
+    echo $CONFIG_DATA > $CONFIG_FILE
+fi
+
+# We then do the same for the github API key
+if [[ "$GITHUB_API_KEY" == "null" || "$RESET_API_KEY" == "true" ]]; then
+    printf "What is your github API key?: "
+    read -s GITHUB_API_KEY
+
+    CONFIG_DATA=$(echo $CONFIG_DATA | G=$GITHUB_API_KEY yq '.api_key = env(G)' -o json)
+    mkdir -p ~/.config
+
+    echo $CONFIG_DATA > $CONFIG_FILE
+fi
+
+# Extract the project name from the current `origin`. Right now we don't support using other remotes
+PROJECT=$(git remote get-url origin | sed 's/^https:\/\/github\.com\/\(.*\)\.git$/\1/g')
+
+PR_NUMBER=${ARGS[0]}
+FROM_COMMIT=${ARGS[1]}
+
+# The first api call we need is to get the base and head commits of the PR
+PR_DATA=$(curl --request GET \
+  --url https://api.github.com/repos/${PROJECT}/pulls/${PR_NUMBER} \
+  --header 'Accept: application/vnd.github+json' \
+  --header 'Authorization: Bearer '${GITHUB_API_KEY} 2>/dev/null)
+
+BASE=$(echo $PR_DATA | yq ".base.sha")
+HEAD=$(echo $PR_DATA | yq ".head.sha")
+
+if [[ "$BASE" == "null" ]]; then
+    printf "Invalid PR number\n"
+    exit 1
+fi
+
+# Then we can fetch list of reviews, and gather the last review from the current user
+# If there's a `FROM_COMMIT` parameter, then we omit this and use that as the commit to
+# base off of
+if [[ "$FROM_COMMIT" == "" ]]; then
+    HEADER_RE='<[^>]*page=([^>]*)>; rel="last"'
+
+    HEADER_DATA=$(curl --head \
+    --url https://api.github.com/repos/${PROJECT}/pulls/${PR_NUMBER}/reviews \
+    --header 'Accept: application/vnd.github+json' \
+    --header 'Authorization: Bearer '${GITHUB_API_KEY} \
+    -sS \
+    | grep -e '^link: ' || true)
+
+    if [[ "$HEADER_DATA" =~ $HEADER_RE ]]; then
+        LAST_PAGE=${BASH_REMATCH[1]}
+    else
+        LAST_PAGE=1
+    fi
+
+    for PAGE in $(seq $LAST_PAGE 1); do
+        REVIEW_DATA=$(curl --request GET \
+        --url https://api.github.com/repos/${PROJECT}/pulls/${PR_NUMBER}/reviews?page=${PAGE} \
+        --header 'Accept: application/vnd.github+json' \
+        --header 'Authorization: Bearer '${GITHUB_API_KEY} 2>/dev/null)
+
+        BASE_QUERY='map(select(.user.login == env(U) and (.state == "CHANGES_REQUESTED" or .state == "APPROVED" or .state == "COMMENTED")))'
+
+        REVIEW_EXISTS=$( \
+            echo $REVIEW_DATA \
+            | U=$USER_NAME yq \
+                "$BASE_QUERY | length > 0" \
+        )
+
+        if [[ "$REVIEW_EXISTS" == "true" ]]; then
+            FROM_COMMIT=$( \
+                echo $REVIEW_DATA \
+                | U=$USER_NAME yq \
+                    "$BASE_QUERY | .[-1].commit_id" \
+            )
+
+            break
+        fi
+    done
+fi
+
+# If he haven't reviewed it, we just show the full commit diff
+if [[ "$FROM_COMMIT" == "null" ]]; then
+    printf "No existing review on this PR. Showing the complete diff. (Press enter to continue)"
+    read -s
+
+    git fetch $BASE $HEAD 2> /dev/null
+    git difftool $BASE..$HEAD
+
+    exit 0
+fi
+
+if [[ "$FROM_COMMIT" == "$HEAD" ]]; then
+    printf "No new changes on PR ${PR_NUMBER}\n"
+    exit 1
+fi
+
+git fetch origin $BASE $FROM_COMMIT $HEAD 2> /dev/null
+
+ORIGINAL_MERGE_BASE=$(git merge-base ${BASE} ${FROM_COMMIT})
+NEW_MERGE_BASE=$(git merge-base ${BASE} ${HEAD})
+LOCAL_MERGE_BASE=$(git merge-base ${FROM_COMMIT} ${HEAD})
+
+if [[ "$VERBOSE" == "true" ]]; then
+    printf "BASE: $BASE\n"
+    printf "FROM_COMMIT: $FROM_COMMIT\n"
+    printf "HEAD: $HEAD\n"
+    printf "ORIGINAL_MERGE_BASE: $ORIGINAL_MERGE_BASE\n"
+    printf "NEW_MERGE_BASE: $NEW_MERGE_BASE\n"
+    printf "LOCAL_MERGE_BASE: $LOCAL_MERGE_BASE\n"
+    printf "\n"
+fi
+
+
+# We check to see if FROM_COMIT is in the ancestry tree of HEAD.
+# Even if they operate on a different base branch, we can still show
+# a raw diff because it's a fast-forward. This is useful for when the
+# base of the PR has changed out from underneath the PR, but neither commit
+# has been rebased atop it.
+
+if [[ "$LOCAL_MERGE_BASE" == "$FROM_COMMIT" ]]; then
+    printf "Detected fast-forward. Showing the diff since last update. (Press enter to continue)"
+    read -s
+
+    git difftool $FROM_COMMIT $HEAD
+
+    exit 0
+fi
+
+
+# Otherwise, we collect the merge base of all three commits.
+# If the merge base is the same as the PR base, then it means
+# Nothing has been rebased and we can just show the diff between
+# the last review and the current PR head
+
+if [[ "$ORIGINAL_MERGE_BASE" == "$NEW_MERGE_BASE" ]]; then
+    printf "Detected pure update. Showing the diff since last update. (Press enter to continue)"
+    read -s
+
+    git difftool $FROM_COMMIT $HEAD
+
+    exit 0
+fi
+
+# Otherwise, we assume there was a rebase in between the last review and the current PR head
+# And we show a ddiff (range-diff)
+
+printf "Detected rebase. Showing the ddiff between the previous review and this one. (Press enter to continue)"
+read -s
+
+git range-diff $BASE $FROM_COMMIT $HEAD --creation-factor=80
+

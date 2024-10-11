@@ -1,0 +1,22 @@
+#!/bin/bash
+
+set -e
+
+STAGING_SRV="srv-coqhns0l5elc73crlp70"
+PROD_SRV="srv-cotuo8f109ks73d5k160"
+
+get_latest_commit() {
+	curl \
+		--header "Authorization:Bearer ${RENDER_API_KEY}" \
+		https://api.render.com/v1/services/$1/deploys \
+		2>/dev/null \
+	| yq '.[] | select(.deploy.status == "live") | .deploy.commit.id'	
+}
+
+STAGING_COMMIT=$(get_latest_commit $STAGING_SRV)
+PROD_COMMIT=$(get_latest_commit $PROD_SRV)
+
+echo git log ${PROD_COMMIT}..${STAGING_COMMIT}
+
+git fetch origin $STAGING_COMMIT
+git log $PROD_COMMIT..$STAGING_COMMIT
